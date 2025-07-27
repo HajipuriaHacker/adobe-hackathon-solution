@@ -266,23 +266,38 @@ def is_numbery(text):
 
 
 def is_likely_list_item(line, page_lines, para_stats):
+    """
+    Checks if a line is likely a list item. This version is more careful
+    not to misclassify styled headings.
+    """
+    # --- NEW EXCEPTION RULE ---
+    # If the line is bold and the paragraph font is not, it's a heading, not a list item.
+    is_line_bold = is_bold(line.get('fontname', ''))
+    is_para_font_bold = is_bold(para_stats.get("para_fontname_primary", ""))
+    if is_line_bold and not is_para_font_bold:
+        return False
+
+    # Original logic remains, but is now secondary to the style check
     if line['avg_size'] > para_stats['para_range'][1] * 1.1 or line['words'] >= para_stats['para_words_mean']:
         return False
     try:
         current_index = page_lines.index(line)
-    except ValueError:
-        return False
+    except (ValueError, KeyError):
+        return False # Cannot determine context if not found
+             
     def is_similar(l1, l2):
         if abs(l1['avg_size'] - l2['avg_size']) > 0.5: return False
         if abs(l1['x0'] - l2['x0']) > 15: return False
         if l2['words'] >= para_stats['para_words_mean']: return False
         return True
+    
     similar_before, similar_after = 0, 0
     for i in range(1, 3):
         if current_index - i >= 0 and is_similar(line, page_lines[current_index - i]):
             similar_before += 1
         if current_index + i < len(page_lines) and is_similar(line, page_lines[current_index + i]):
             similar_after += 1
+            
     return (similar_before >= 1 and similar_after >= 1) or similar_before >= 2 or similar_after >= 2
 
 
@@ -303,7 +318,7 @@ def heading_format_ok(text):
         return False
 
     # Rule 4: Reject if the entire line is enclosed in brackets
-    if re.fullmatch(r'\(.*\)', text) or re.fullmatch(r'\[.*\]', text):
+    if re.fullmatch(r'\(.\)', text) or re.fullmatch(r'\[.\]', text):
         return False
         
     # Rule 5: Reject if the line is likely just a date
@@ -423,48 +438,103 @@ def group_multiline_headings(headings, all_lines):
 
 
 def clean_headings_for_output(grouped_headings):
+    """
+    Cleans up the grouped headings and ensures all necessary keys,
+    including 'page_w', are preserved for the final structuring step.
+    """
     return [{
-        "page": h['page'], "text": h['text'], "words": len(h['text'].split()),
-        "chars": len(h['text']), "avg_size": h['avg_size'], "fontname": h['fontname'],
-        "avg_ws": round(mean([h['above_ws'], h['below_ws']]), 2),
-        "x0": h.get('x0'), "x1": h.get('x1'), "top": h.get('top'), "bottom": h.get('bottom'),
-        "page_h": h.get('page_h')
+        "page": h.get('page'), 
+        "text": h.get('text', ''), 
+        "words": len(h.get('text', '').split()),
+        "chars": len(h.get('text', '')), 
+        "avg_size": h.get('avg_size'), 
+        "fontname": h.get('fontname'),
+        "avg_ws": round(mean([h.get('above_ws', 0), h.get('below_ws', 0)]), 2),
+        "x0": h.get('x0'), 
+        "x1": h.get('x1'), 
+        "top": h.get('top'), 
+        "bottom": h.get('bottom'),
+        "page_h": h.get('page_h'),
+        "page_w": h.get('page_w')  # <-- THE FIX: This key is now included.
     } for h in grouped_headings]
 
 
-def structure_outline_from_headings(headings):
+
+def structure_outline_with_final_rules(headings):
     """
-    Takes a list of cleaned headings and assigns levels based on a strict
-    H1-H4 hierarchy.
+    This is the definitive structuring function. It uses a base font ranking
+    and then applies a series of specific, user-defined rules for H1 subtitles,
+    numbered headings, and conservative H4 assignment.
     """
     if not headings:
         return []
 
+    # 1. Sort all headings by their position in the document
     outline_headings = sorted(headings, key=lambda h: (h['page'], h['top']))
-    
-    # Get all unique font sizes from headings, sorted largest to smallest
-    font_sizes = sorted(list(set(h['avg_size'] for h in outline_headings)), reverse=True)
 
-    # --- NEW LOGIC: Limit to a maximum of 4 heading levels ---
-    # Take only the top 4 font sizes to define the levels
-    top_four_sizes = font_sizes[:4]
+    # 2. Establish a font-size-to-rank mapping (uncapped).
+    all_heading_sizes = sorted(list(set(h.get('avg_size', 0) for h in outline_headings)), reverse=True)
+    level_map = {size: i + 1 for i, size in enumerate(all_heading_sizes)}
 
-    # Create a mapping from font size to a level number (1, 2, 3, 4)
-    size_to_level = {size: i + 1 for i, size in enumerate(top_four_sizes)}
-
-    structured_outline = []
+    # 3. Assign an initial, uncapped level to all headings
     for h in outline_headings:
-        # Get the level from our mapping.
-        # If the font size is not in the top four, default to level 4 (H4).
-        level_num = size_to_level.get(h['avg_size'], 4)
+        h['level'] = level_map.get(h.get('avg_size', 0), 99) # Default to a high number
+
+    # 4. Perform a final correction pass using the new rules
+    corrected_headings = []
+    if not outline_headings:
+        return []
         
+    corrected_headings.append(outline_headings[0])
+
+    for i in range(1, len(outline_headings)):
+        prev_h = corrected_headings[-1]
+        curr_h = outline_headings[i]
+        
+        # --- RULE 1: Force Numbered Headings to H3 (Strong Override) ---
+        # THIS IS THE CORRECTED REGEX: It now accepts a space OR a dot after the number.
+        is_numbered_heading = re.match(r'^\d+(\.\d+)*[\.\s]', curr_h.get('text', ''))
+        if is_numbered_heading:
+            curr_h['level'] = 3
+        
+        # --- RULE 2: H1 Subtitle Promotion ---
+        if prev_h.get('level') == 1 and curr_h.get('page') == prev_h.get('page'):
+            is_close_vertically = (curr_h.get('top', 0) - prev_h.get('bottom', 0)) < (prev_h.get('avg_size', 12) * 3)
+            is_top_tier_font = len(all_heading_sizes) > 1 and curr_h.get('avg_size', 0) >= all_heading_sizes[1]
+            if is_close_vertically and is_top_tier_font:
+                curr_h['level'] = 1 # Promote to H1
+        
+        # --- RULE 3: Conservative H4 Assignment ---
+        is_provisional_h4_or_lower = level_map.get(curr_h.get('avg_size', 0), 99) >= 4
+        if is_provisional_h4_or_lower and prev_h.get('level') == 3:
+            if curr_h.get('avg_size', 0) >= prev_h.get('avg_size', 0) * 0.85:
+                curr_h['level'] = 3 # Promote to H3
+        
+        # --- Final Hierarchy Rule ---
+        if curr_h.get('level', 99) > prev_h.get('level', 99) + 1:
+            curr_h['level'] = prev_h.get('level', 99) + 1
+            
+        corrected_headings.append(curr_h)
+
+    # 5. Final Pass: Apply the H4 Cap and Format for Output
+    structured_outline = []
+    for h in corrected_headings:
+        final_level = min(h['level'], 4) # Cap the level at H4
         structured_outline.append({
-            "level": f"H{level_num}", 
-            "text": h['text'], 
+            "level": f"H{final_level}",
+            "text": h['text'].strip(),
             "page": h['page']
         })
     
     return structured_outline
+
+
+
+
+
+
+
+
 
 
 def process_pdf(pdf_path, output_dir, debug_print=False):
@@ -596,46 +666,47 @@ def process_pdf(pdf_path, output_dir, debug_print=False):
     
     cleaned_headings = clean_headings_for_output(grouped_headings)
     
-    structured_outline = structure_outline_from_headings(cleaned_headings)
+    # In process_pdf():
+    structured_outline = structure_outline_with_final_rules(cleaned_headings)
+
+
     
     final_structured_output = {
         "title": title_text,
         "outline": structured_outline
     }
     
-    output_json = output_dir / f"{pdf_path.stem}.json"
+    output_json = output_dir / f"{pdf_path.stem}.json" 
     with open(output_json, "w", encoding="utf-8") as f:
         json.dump(final_structured_output, f, indent=4, ensure_ascii=False)
     print(f"[SUCCESS] Saved structured headings to: {output_json}")
 
 
 if __name__ == "__main__":
-    # --- Adobe Hackathon Compliant Execution ---
-    # Input and output directories are fixed as per the Docker run command rules.
+    # Define fixed input and output directories as per the challenge rules
     input_dir = Path("/app/input")
     output_dir = Path("/app/output")
-    
-    # Debug mode is turned off for official runs, can be enabled for testing.
-    debug_mode = False 
 
-    # Ensure the output directory exists within the container.
+    # Ensure the output directory exists. This is crucial inside the container.
     output_dir.mkdir(exist_ok=True)
 
-    files_to_process = sorted(list(input_dir.glob("*.pdf")))
-    
+    # Set debug mode directly. For submission, you might set this to False.
+    # Alternatively, you could use an environment variable.
+    debug_mode = False 
+
+    # Find all PDF files in the mandatory input directory
+    files_to_process = sorted(list(input_dir.rglob("*.pdf")))
     if not files_to_process:
-        print("[WARN] No PDF files found in /app/input. Exiting.")
+        print(f"[WARN] No PDF files found in {input_dir}")
         sys.exit(0)
 
-    print(f"[INFO] Found {len(files_to_process)} PDF(s) to process from /app/input.")
+    print(f"[INFO] Found {len(files_to_process)} PDF(s) to process.")
     for idx, pdf_path in enumerate(files_to_process, 1):
         print(f"\n--- [{idx}/{len(files_to_process)}] ---")
         try:
-            # The process_pdf function now needs to write to the correct output_dir
+            # Pass the correct output directory to your processing function
             process_pdf(pdf_path, output_dir, debug_print=debug_mode)
         except Exception as e:
             print(f"[CRITICAL ERROR] Failed to process {pdf_path.name}: {e}")
             import traceback
             traceback.print_exc()
-
-
