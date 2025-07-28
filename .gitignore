@@ -1,0 +1,6 @@
+# Ignore large ML model files
+Challenge-1b/models/
+
+# Ignore generated output files
+Challenge-1b/Collection_*/challenge1b_output.json
+Challenge-1b/Collection_*/structured_outputs/
